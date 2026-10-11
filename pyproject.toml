@@ -1,0 +1,23 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "ares-cli"
+version = "0.1.0"
+description = "The most powerful AI powered cybersecurity tool"
+readme = "README.md"
+requires-python = ">=3.8"
+license = "MIT"
+authors = [{name = "Antim8er"}]
+dependencies = [
+    "typer>=0.9",
+    "rich>=13",
+    "python-dotenv>=1.0",
+]
+
+[project.scripts]
+ares-cli = "ares.cli:app"
+
+[tool.hatch.build.targets.wheel]
+packages = ["ares"]

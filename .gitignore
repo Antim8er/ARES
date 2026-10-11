@@ -1,0 +1,40 @@
+# Environment variables & secrets
+.env
+*.env
+
+# Session & temporary runtime files
+.pentera_session.json
+.ares_session.json
+*.log
+
+# Python bytecode & cache
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Build & packaging artifacts
+build/
+dist/
+*.egg-info/
+*.egg
+
+# IDEs & editors
+.vscode/
+.idea/
+*.sublime-project
+*.sublime-workspace
+
+# Operating System files
+.DS_Store
+Thumbs.db
+
+# Project-specific archives & internal design artifacts
+archive/
+.archify/
