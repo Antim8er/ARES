@@ -1,0 +1,15 @@
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+.ares_session.json
+.env
+.git
+.github
+reports/
+venv/
+.venv/
+dist/
+build/
+*.egg-info/

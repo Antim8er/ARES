@@ -1,0 +1,25 @@
+name: Feature Request
+description: Suggest an idea or enhancement for A.R.E.S.
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: Thank you for contributing your ideas to the roadmap!
+  - type: textarea
+    id: problem
+    attributes:
+      label: Is your feature related to a problem or limitation?
+      placeholder: A clear description of what challenge or workflow needs improvement.
+    validations:
+      required: true
+  - type: textarea
+    id: solution
+    attributes:
+      label: Describe the Solution You'd Like
+      placeholder: Detailed description of the proposed feature, CLI option, or tool integration.
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Additional Context or Alternatives Considered

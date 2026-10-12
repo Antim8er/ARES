@@ -63,3 +63,16 @@ def test_llm_client_instantiation():
     client = get_client()
     assert client.chat is not None
     assert client.chat.completions is not None
+
+
+def test_llm_client_custom_options():
+    """Ensure client properly receives custom base URL and API key."""
+    from ares.llm.client import normalize_base_url, LLMConnectionError
+    assert normalize_base_url("http://localhost:11434") == "http://localhost:11434/v1"
+    assert normalize_base_url("http://localhost:11434/v1") == "http://localhost:11434/v1"
+
+    client = get_client(base_url="http://custom-host:8000", api_key="secret-token")
+    assert client.chat.completions.base_url == "http://custom-host:8000/v1"
+    assert client.chat.completions.api_key == "secret-token"
+    assert issubclass(LLMConnectionError, Exception)
+

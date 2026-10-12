@@ -5,16 +5,51 @@ build-backend = "hatchling.build"
 [project]
 name = "ares-cli"
 version = "0.1.0"
-description = "The most powerful AI powered cybersecurity tool"
+description = "Autonomous Reconnaissance & Exploitation System - 100% Local AI Pentesting CLI"
 readme = "README.md"
 requires-python = ">=3.8"
 license = "MIT"
 authors = [{name = "Antim8er"}]
+keywords = [
+    "cybersecurity",
+    "penetration-testing",
+    "ai-agent",
+    "llm",
+    "red-team",
+    "infosec",
+    "offensive-security",
+    "local-llm",
+    "reconnaissance",
+    "ollama",
+    "lm-studio"
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Information Technology",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Security",
+]
 dependencies = [
     "typer>=0.9",
     "rich>=13",
     "python-dotenv>=1.0",
 ]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/Antim8er/ARES"
+Repository = "https://github.com/Antim8er/ARES"
+Issues = "https://github.com/Antim8er/ARES/issues"
 
 [project.scripts]
 ares-cli = "ares.cli:app"

@@ -33,15 +33,15 @@ load_dotenv()
 console = Console()
 
 # Core configuration & LLM client
-from ares.config import DEFAULT_MODEL
-from ares.llm.client import get_client
+from ares.config import DEFAULT_MODEL, DEFAULT_BASE_URL, DEFAULT_API_KEY
+from ares.llm.client import get_client, LLMConnectionError
 from ares.llm.prompts import NEXT_COMMAND_PROMPT
 
 app = typer.Typer(
     name="ares",
     help="The most powerful AI powered cybersecurity tool",
     add_completion=False,
-    no_args_is_help=True,
+    no_args_is_help=False,
 )
 
 BANNER = r"""
@@ -67,6 +67,8 @@ def ask(
     real: bool = typer.Option(False, "--real", help="Execute commands for real"),
     target: Optional[str] = typer.Option(None, "--target", "-t", help="Target e.g. scanme.nmap.org"),
     auto_confirm: bool = typer.Option(False, "--auto-confirm", help="Auto-confirm all executions (dangerous)"),
+    url: Optional[str] = typer.Option(None, "--url", "-u", help="LLM endpoint URL (e.g. http://localhost:11434/v1 for Ollama)"),
+    api_key: Optional[str] = typer.Option(None, "--api-key", "-k", help="API key for authenticated endpoints"),
 ):
     console.print(Panel(
         Text.from_markup(BANNER, justify="left", style="bold"),
@@ -79,8 +81,8 @@ def ask(
     os_name = platform.system()
     console.print(f"[bold cyan]Detected OS:[/bold cyan] {os_name}")
 
-    client = get_client()
-    console.print(f"[dim]→ Using model: {model}[/dim]")
+    client = get_client(base_url=url, api_key=api_key)
+    console.print(f"[dim]→ Using model: {model} | Endpoint: {client.chat.completions.base_url}[/dim]")
 
     if real:
         simulate = False
@@ -138,17 +140,25 @@ def ask(
                     context = f"User Input: {question}\n(If this is a task, create an initial high-level plan. If it's a conversational message, respond accordingly.)\n\n" + context
                     initial_plan_done = True
 
-                response = client.chat.completions.create(
-                    model=model,
-                    messages=[
-                        {"role": "system", "content": NEXT_COMMAND_PROMPT},
-                        {"role": "user", "content": context + "\n\n→ Generate the next step:"},
-                    ],
-                    temperature=0.25,
-                    max_tokens=1000,
-                )
+                try:
+                    response = client.chat.completions.create(
+                        model=model,
+                        messages=[
+                            {"role": "system", "content": NEXT_COMMAND_PROMPT},
+                            {"role": "user", "content": context + "\n\n→ Generate the next step:"},
+                        ],
+                        temperature=0.25,
+                        max_tokens=1000,
+                    )
+                except LLMConnectionError:
+                    console.print("[bold red]Session stopped due to LLM connection failure.[/bold red]")
+                    return
 
             answer = response.choices[0].message.content.strip()
+
+            if answer == "END FLOW":
+                console.print("[yellow]Session terminated by engine.[/yellow]")
+                return
             
             # Clean up markdown JSON block if present
             if answer.startswith("```json"):
@@ -163,9 +173,13 @@ def ask(
                 parsed = json.loads(answer)
             except json.JSONDecodeError:
                 console.print(f"[bold red]Failed to parse LLM JSON response:[/bold red]\n{answer}")
-                console.print("[yellow]Retrying...[/yellow]")
-                previous_output = "SYSTEM: You must return valid JSON matching the schema without any additional markdown or text."
-                continue
+                if step_count > 0:
+                    console.print("[yellow]Retrying with schema reminder...[/yellow]")
+                    previous_output = "SYSTEM: You must return valid JSON matching the schema without any additional markdown or text."
+                    continue
+                else:
+                    console.print("[yellow]Model did not provide valid JSON. Please verify your selected model supports instruction/JSON output.[/yellow]")
+                    break
 
             extracted_command = parsed.get("command", "")
             is_completed = parsed.get("is_task_completed", False)

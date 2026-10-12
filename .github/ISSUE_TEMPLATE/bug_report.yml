@@ -1,0 +1,36 @@
+name: Bug Report
+description: File an issue or report unexpected behavior in A.R.E.S.
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: Thanks for taking the time to report an issue!
+  - type: input
+    id: os
+    attributes:
+      label: Operating System
+      placeholder: Windows 11, Kali Linux 2024.1, macOS Sonoma
+    validations:
+      required: true
+  - type: input
+    id: llm
+    attributes:
+      label: LLM Engine & Model
+      placeholder: LM Studio (dolphin3-cyber-8b) or Ollama (qwen2.5:14b)
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Steps to Reproduce
+      placeholder: |
+        1. Run `ares-cli "..."`
+        2. Enter option...
+        3. See error...
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant Terminal Output or Logs
+      render: shell

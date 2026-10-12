@@ -1,0 +1,15 @@
+services:
+  ares:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: ares-cli:latest
+    container_name: ares-cli
+    network_mode: host
+    volumes:
+      - ./reports:/workspace
+    environment:
+      - ARES_LLM_URL=http://localhost:1234/v1
+      - ARES_DEFAULT_MODEL=local-model
+    stdin_open: true
+    tty: true
