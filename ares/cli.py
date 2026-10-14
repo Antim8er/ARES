@@ -11,6 +11,7 @@ import re
 import json
 import shlex
 import shutil
+from urllib.parse import urlparse
 import typer
 from dotenv import load_dotenv
 from rich.console import Console
@@ -59,6 +60,54 @@ def strip_ansi(text):
     return ansi_escape.sub('', text)
 
 
+# ---------------------------------------------------------------------------
+# Guardrail helpers
+# ---------------------------------------------------------------------------
+
+def sanitize_target(raw_target: str) -> str:
+    """Extract clean hostname/IP from a target that may be a full URL.
+
+    Examples:
+        https://example.com/path  -> example.com
+        http://10.0.0.1:8080/     -> 10.0.0.1
+        scanme.nmap.org           -> scanme.nmap.org  (unchanged)
+    """
+    raw_target = raw_target.strip()
+    if "://" in raw_target:
+        parsed = urlparse(raw_target)
+        return parsed.hostname or raw_target
+    # Strip trailing slashes from bare domains
+    return raw_target.rstrip("/")
+
+
+# Regex to detect unreplaced placeholder tokens like <target-ip>, [target], {ip}, TARGET_IP
+_PLACEHOLDER_RE = re.compile(
+    r'<[a-zA-Z][a-zA-Z0-9_\-]*>'        # <target-ip>, <url>, <domain>
+    r'|\[[a-zA-Z][a-zA-Z0-9_\-]*\]'      # [target], [IP]
+    r'|\{[a-zA-Z][a-zA-Z0-9_\-]*\}'      # {target}, {ip}
+    r'|(?<!\w)TARGET_IP(?:_ADDRESS)?(?!\w)'  # TARGET_IP, TARGET_IP_ADDRESS
+)
+
+
+def has_placeholders(command: str) -> str | None:
+    """Return the first placeholder token found in a command, or None if clean."""
+    match = _PLACEHOLDER_RE.search(command)
+    return match.group(0) if match else None
+
+
+def infer_tool_from_command(command: str) -> str:
+    """Extract the tool binary name from the first token of a command.
+
+    Strips .exe suffix on Windows for consistency.
+    """
+    if not command:
+        return ""
+    first_token = command.split()[0].strip('"').strip("'")
+    if first_token.lower().endswith(".exe"):
+        first_token = first_token[:-4]
+    return first_token
+
+
 @app.command("ask")
 def ask(
     question: Optional[str] = typer.Argument(None, help="Pentest task or question (optional, will prompt if empty)"),
@@ -88,7 +137,14 @@ def ask(
         simulate = False
         console.print("[bold yellow]REAL EXECUTION MODE ACTIVE — USE WITH CAUTION[/bold yellow]")
 
-    actual_target = target if target else "None provided (Ask the user)"
+    # --- Sanitize target: strip URL scheme/path so tools get a clean hostname ---
+    if target:
+        raw_target = target
+        actual_target = sanitize_target(target)
+        if actual_target != raw_target:
+            console.print(f"[dim]→ Sanitized target: {raw_target} → {actual_target}[/dim]")
+    else:
+        actual_target = "None provided (Ask the user)"
     
     # Load session if it exists
     session_file = ".ares_session.json"
@@ -120,17 +176,20 @@ def ask(
         report += f"\n### New Task: {question} (Target: {actual_target})\n"
         initial_plan_done = False
         task_finished = False
+        last_failed_command = None      # Track last command that failed
+        consecutive_failures = 0        # Count back-to-back failures
 
         while True:
             with console.status("[bold cyan]Ares thinking...[/bold cyan]", spinner="dots12"):
                 conv_text = "\n".join(conversation_history[-10:])
                 context_prefix = f"Conversation History:\n{conv_text}\n\n" if conv_text else ""
                 
-                target_str = actual_target if actual_target != "None provided (Ask the user)" else "UNKNOWN (Check Task or Conversation History, otherwise ask user)"
+                target_str = actual_target if actual_target != "None provided (Ask the user)" else "UNKNOWN"
                 
                 context = (
                 f"{context_prefix}Task: {question}\n"
                 f"Target: {target_str}\n"
+                f"OS: {os_name}\n"
                 f"CRITICAL: You are running on {os_name}. Use {os_name}-compatible commands (e.g. CMD or 'powershell -c' on Windows).\n"
                 f"Previous command output (truncated):\n{previous_output[:1400]}\n"
                 f"Current report tail:\n{report[-1000:]}\n"
@@ -188,6 +247,12 @@ def ask(
             tool_required = parsed.get("tool_required", "")
             message_to_user = parsed.get("message_to_user", "")
 
+            # --- Guardrail: auto-fill tool_required from command if model left it empty ---
+            if extracted_command and not tool_required:
+                tool_required = infer_tool_from_command(extracted_command)
+                if tool_required:
+                    console.print(f"[dim]→ Auto-detected tool: {tool_required}[/dim]")
+
             if analysis or plan or tool_required:
                 panel_text = f"**Analysis:** {analysis}\n\n**Plan:** {plan}\n\n**Tool:** {tool_required}"
                 console.print(Panel(
@@ -220,6 +285,41 @@ def ask(
                 
                 break
 
+            # --- Guardrail: Block commands containing unreplaced placeholders ---
+            placeholder = has_placeholders(extracted_command)
+            if placeholder:
+                console.print(f"[bold red]⚠ Blocked command containing placeholder: {placeholder}[/bold red]")
+                console.print(f"[dim]Rejected: {extracted_command}[/dim]")
+                previous_output = (
+                    f"SYSTEM ERROR: Your command was REJECTED because it contained the placeholder '{placeholder}'. "
+                    f"Placeholders like <target-ip>, [target], {{ip}} are FORBIDDEN. "
+                    f"The actual target is: {actual_target} — use it directly in your command. "
+                    f"Generate a corrected command now."
+                )
+                consecutive_failures += 1
+                if consecutive_failures >= 3:
+                    console.print("[bold red]Too many consecutive failures — stopping to prevent infinite loop.[/bold red]")
+                    task_finished = True
+                    report += "\n\n## Final Summary\nStopped: model repeatedly generated invalid commands."
+                    break
+                continue
+
+            # --- Guardrail: Detect repeated failed commands ---
+            if extracted_command == last_failed_command:
+                console.print(f"[bold yellow]⚠ Model repeated a previously failed command — requesting alternative[/bold yellow]")
+                previous_output = (
+                    f"SYSTEM ERROR: You repeated the exact same command that already failed: `{extracted_command}`. "
+                    f"Do NOT repeat failed commands. Analyze WHY it failed and either: "
+                    f"(1) fix the syntax/arguments, (2) use a different tool, or (3) ask the user for guidance."
+                )
+                consecutive_failures += 1
+                if consecutive_failures >= 3:
+                    console.print("[bold red]Too many consecutive failures — stopping to prevent infinite loop.[/bold red]")
+                    task_finished = True
+                    report += "\n\n## Final Summary\nStopped: model repeatedly generated failing commands."
+                    break
+                continue
+
             if step_count >= 20:
                 console.print("[yellow]Maximum steps (20) reached. Stopping to prevent infinite loop.[/yellow]")
                 task_finished = True
@@ -233,23 +333,26 @@ def ask(
                 console.print("[yellow]Simulation mode — no real execution[/yellow]")
                 previous_output = "SIMULATED SUCCESS (assume command worked and generated expected output. Output [TASK_COMPLETED] if finished)."
                 report += f"\n### Step {step_count}: `{extracted_command}`\n(simulated)\n"
+                consecutive_failures = 0
+                last_failed_command = None
                 continue
 
             # --- Proactive Tool Check ---
-            if tool_required and tool_required.lower() not in ["cmd", "powershell", "echo", "cd", "dir"]:
-                if not shutil.which(tool_required) and tool_required not in attempted_installs:
-                    console.print(f"[yellow]Proactively detected missing tool: {tool_required}[/yellow]")
-                    attempted_installs.add(tool_required)
+            effective_tool = tool_required or infer_tool_from_command(extracted_command)
+            if effective_tool and effective_tool.lower() not in ["cmd", "powershell", "echo", "cd", "dir", "type", "findstr", "where"]:
+                if not shutil.which(effective_tool) and effective_tool not in attempted_installs:
+                    console.print(f"[yellow]Proactively detected missing tool: {effective_tool}[/yellow]")
+                    attempted_installs.add(effective_tool)
                     install_cmd = None
                     if os_name == "Windows":
-                        install_cmd = f"winget install {tool_required} -e --accept-source-agreements --accept-package-agreements"
+                        install_cmd = f"winget install {effective_tool} -e --accept-source-agreements --accept-package-agreements"
                     elif os_name == "Linux":
-                        install_cmd = f"sudo apt update && sudo apt install -y {tool_required}"
+                        install_cmd = f"sudo apt update && sudo apt install -y {effective_tool}"
                     elif os_name == "Darwin":
-                        install_cmd = f"brew install {tool_required}"
+                        install_cmd = f"brew install {effective_tool}"
 
-                    if install_cmd and (auto_confirm or Confirm.ask(f"Attempt to install {tool_required} now?", default=False)):
-                        console.print(f"[green]Running install for {tool_required}...[/green]")
+                    if install_cmd and (auto_confirm or Confirm.ask(f"Attempt to install {effective_tool} now?", default=False)):
+                        console.print(f"[green]Running install for {effective_tool}...[/green]")
                         subprocess.run(install_cmd, shell=True)
                         console.print("[green]Install attempt completed.[/green]")
                         
@@ -350,6 +453,19 @@ def ask(
                         return_code = 1
 
             console.print(f"[dim]Exit code indication: {return_code}[/dim]")
+
+            # --- Track failures for repeat/consecutive detection ---
+            if return_code != 0:
+                last_failed_command = extracted_command
+                consecutive_failures += 1
+                if consecutive_failures >= 3:
+                    console.print("[bold red]3 consecutive command failures — stopping to prevent infinite loop.[/bold red]")
+                    task_finished = True
+                    report += "\n\n## Final Summary\nStopped: 3 consecutive command failures."
+                    break
+            else:
+                last_failed_command = None
+                consecutive_failures = 0
 
             report += f"\n### Step {step_count}: `{extracted_command}`\nOutput (truncated):\n{output[:350]}...\n"
             previous_output = f"Command: {extracted_command}\nOutput:\n{output}"
