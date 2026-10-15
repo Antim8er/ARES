@@ -22,10 +22,17 @@ from rich.status import Status
 from rich.text import Text
 from rich import box
 
-# Fix Windows Console Encoding
+# Fix Windows Console Encoding & Subprocess Python UTF-8
+os.environ["PYTHONIOENCODING"] = "utf-8"
+os.environ["PYTHONUTF8"] = "1"
+
 if sys.platform == "win32":
     try:
         sys.stdout.reconfigure(encoding='utf-8')
+    except Exception:
+        pass
+    try:
+        sys.stderr.reconfigure(encoding='utf-8')
     except Exception:
         pass
 
@@ -153,6 +160,9 @@ def clean_command_output(output: str) -> str:
         re.compile(r"^Initiating\s+.*Scan\s+at\b", re.IGNORECASE),
         re.compile(r"^Completed\s+.*Scan\s+at\b", re.IGNORECASE),
         re.compile(r"^\s*\[[=\s>-]+\]\s*\d+%", re.IGNORECASE),
+        re.compile(r"^\s*%\s+Total\b", re.IGNORECASE),
+        re.compile(r"^\s*Dload\s+Upload\b", re.IGNORECASE),
+        re.compile(r"^\s*\d+\s+\d+\s+\d+\s+\d+\s+\d+\s+\d+\b", re.IGNORECASE),
     ]
     for line in lines:
         stripped = line.strip()
@@ -390,6 +400,11 @@ def ask(
                     box=box.HEAVY_EDGE,
                 ))
 
+            if message_to_user:
+                cleaned_msg = message_to_user.strip()
+                if cleaned_msg.lower().rstrip(".") in ["optional", "none", "n/a", "null", "undefined"]:
+                    message_to_user = ""
+
             if message_to_user and not extracted_command:
                 console.print(f"\n[bold magenta]Ares:[/bold magenta] {message_to_user}")
                 # We do not add conversational responses to the report to prevent model confusion
@@ -401,6 +416,20 @@ def ask(
                 break
                 
             if not extracted_command:
+                # If in active pentest task and AI provided a plan but forgot the command, prompt for command
+                if step_count > 0 and not is_completed and not message_to_user:
+                    console.print("[yellow]AI generated a plan but no command. Prompting for command...[/yellow]")
+                    previous_output = (
+                        f"SYSTEM: You provided a plan but left 'command' empty. "
+                        f"You must provide a concrete, unexecuted CLI command in 'command' to proceed with your plan, "
+                        f"or set 'is_task_completed': true if the pentest task is finished."
+                    )
+                    consecutive_failures += 1
+                    if consecutive_failures >= 3:
+                        task_finished = True
+                        break
+                    continue
+
                 # Remove the conversational task from the report so it doesn't pollute pentest history
                 task_header = f"\n### New Task: {question} (Target: {actual_target})\n"
                 if report.endswith(task_header):
@@ -438,11 +467,13 @@ def ask(
                 console.print(f"[bold yellow]⚠ AI attempted to repeat command from Step {prev_step}: `{extracted_command}`[/bold yellow]")
                 previous_output = (
                     f"SYSTEM ERROR: You already executed this exact command in Step {prev_step}: `{extracted_command}`. "
-                    f"Repeating previously executed commands (especially port scans) is strictly FORBIDDEN. "
-                    f"Review the findings from your previous steps in the report tail below, and proceed to the next phase: "
-                    f"- Enumerate or test the specific open ports and services already discovered. "
-                    f"- If web services (HTTP/HTTPS) were found, use curl or Python to inspect headers and paths. "
-                    f"- Do NOT run another port scan on this target."
+                    f"Repeating previously executed commands is strictly FORBIDDEN. "
+                    f"You must provide a NEW, DIFFERENT command. For web targets on ports 80/443, pick one of:\n"
+                    f"  - Check robots.txt: curl -sL https://{actual_target}/robots.txt\n"
+                    f"  - Check sensitive paths: python -c \"import urllib.request; [print(p, urllib.request.urlopen('https://{actual_target}' + p).getcode()) for p in ['/robots.txt', '/.env', '/admin', '/login', '/sitemap.xml'] if True]\"\n"
+                    f"  - Test Nmap web vulnerability scripts: nmap -sV --script http-enum,http-headers -p 80,443 {actual_target}\n"
+                    f"  - Extract page title and forms: python -c \"import urllib.request, re; html = urllib.request.urlopen('https://{actual_target}').read().decode('utf-8', 'ignore'); print('Title:', re.findall(r'<title>(.*?)</title>', html, re.I))\"\n"
+                    f"Generate your next new command now."
                 )
                 consecutive_failures += 1
                 if consecutive_failures >= 3:
@@ -590,7 +621,8 @@ def ask(
                             encoding='utf-8',
                             errors='replace',
                             bufsize=1,
-                            universal_newlines=True
+                            universal_newlines=True,
+                            env=dict(os.environ),
                         )
 
                         output_lines = []

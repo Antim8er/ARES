@@ -167,4 +167,23 @@ Output: some error
     assert executed["nikto -h example.com"] == 2
 
 
+def test_clean_command_output_removes_curl_stats():
+    """Verify curl progress meter is filtered from output."""
+    from ares.cli import clean_command_output
+    raw_curl = """  % Total    % Received % Xferd  Average Speed   Time    Time     Time  Current
+                                 Dload  Upload   Total   Spent    Left  Speed
+  0     0    0     0    0     0      0      0 --:--:-- --:--:-- --:--:--     0
+HTTP/1.1 200 OK
+Date: Thu, 15 Oct 2026 19:11:43 GMT
+Server: cloudflare
+Content-Type: text/html"""
+
+    cleaned = clean_command_output(raw_curl)
+    assert "% Total" not in cleaned
+    assert "Dload" not in cleaned
+    assert "HTTP/1.1 200 OK" in cleaned
+    assert "Server: cloudflare" in cleaned
+
+
+
 
