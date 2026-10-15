@@ -61,8 +61,119 @@ def strip_ansi(text):
 
 
 # ---------------------------------------------------------------------------
-# Guardrail helpers
+# Guardrail & Tool helpers
 # ---------------------------------------------------------------------------
+
+KNOWN_TOOLS = ["nmap", "curl", "python", "git", "powershell", "sqlmap", "nikto", "gobuster", "ffuf", "hydra", "wpscan"]
+
+SHELL_BUILTINS = {
+    "cmd", "powershell", "pwsh", "bash", "sh", "zsh",
+    "echo", "cd", "dir", "type", "findstr", "where", "set", "cls",
+    "exit", "del", "copy", "move", "mkdir", "rmdir",
+    "invokewebrequest", "invokerestmethod", "testnetconnection", "getcontent", "startprocess"
+}
+
+def ensure_python_in_path():
+    """Ensure running Python directory and scripts are in PATH so CLI/inline scripts work reliably."""
+    py_dir = os.path.dirname(sys.executable)
+    scripts_dir = os.path.join(py_dir, "Scripts")
+    path_entries = [p for p in os.environ.get("PATH", "").split(os.pathsep) if p]
+    new_entries = []
+    if py_dir not in path_entries:
+        new_entries.append(py_dir)
+    if scripts_dir not in path_entries:
+        new_entries.append(scripts_dir)
+    if new_entries:
+        os.environ["PATH"] = os.pathsep.join(new_entries + path_entries)
+
+def refresh_system_path():
+    """Refresh PATH environment variable from Windows registry without wiping runtime paths."""
+    if platform.system() == "Windows":
+        try:
+            import winreg
+            sys_path = ""
+            user_path = ""
+            with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, r"SYSTEM\CurrentControlSet\Control\Session Manager\Environment") as key:
+                sys_path = winreg.ExpandEnvironmentStrings(winreg.QueryValueEx(key, "Path")[0])
+            try:
+                with winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"Environment") as key:
+                    user_path = winreg.ExpandEnvironmentStrings(winreg.QueryValueEx(key, "Path")[0])
+            except FileNotFoundError:
+                user_path = ""
+            current_paths = [p for p in os.environ.get("PATH", "").split(os.pathsep) if p]
+            registry_paths = [p for p in (sys_path + ";" + user_path).split(";") if p]
+            merged = []
+            for p in current_paths + registry_paths:
+                if p not in merged:
+                    merged.append(p)
+            os.environ["PATH"] = os.pathsep.join(merged)
+        except Exception:
+            pass
+    ensure_python_in_path()
+
+def get_tools_context() -> str:
+    """Return summary of available and unavailable CLI tools on this system."""
+    installed = []
+    unavailable = []
+    for t in KNOWN_TOOLS:
+        if shutil.which(t):
+            installed.append(t)
+        else:
+            unavailable.append(t)
+    return (
+        f"Available CLI tools on this machine: {', '.join(installed) if installed else 'None detected'}\n"
+        f"UNAVAILABLE tools: {', '.join(unavailable)} "
+        f"(CRITICAL: Do NOT run commands for unavailable tools. Use available tools like Python, curl, or PowerShell instead.)"
+    )
+
+def normalize_command(command: str) -> str:
+    """Normalize command for deduplication (lowercase binary, normalized whitespace)."""
+    if not command:
+        return ""
+    tokens = command.strip().split()
+    if not tokens:
+        return ""
+    first_token = tokens[0].lower().strip('"').strip("'")
+    if first_token.endswith(".exe"):
+        first_token = first_token[:-4]
+    tokens[0] = first_token
+    return " ".join(tokens)
+
+def clean_command_output(output: str) -> str:
+    """Clean transient progress/stats lines from command output so key findings aren't crowded out."""
+    if not output:
+        return ""
+    output = strip_ansi(output)
+    lines = output.splitlines()
+    filtered_lines = []
+    noise_patterns = [
+        re.compile(r"^Stats:\s+\d+:\d+:\d+\s+elapsed", re.IGNORECASE),
+        re.compile(r".*Timing:\s+About\s+\d+", re.IGNORECASE),
+        re.compile(r"^About\s+\d+\.\d+%\s+done", re.IGNORECASE),
+        re.compile(r"^Initiating\s+.*Scan\s+at\b", re.IGNORECASE),
+        re.compile(r"^Completed\s+.*Scan\s+at\b", re.IGNORECASE),
+        re.compile(r"^\s*\[[=\s>-]+\]\s*\d+%", re.IGNORECASE),
+    ]
+    for line in lines:
+        stripped = line.strip()
+        if not stripped:
+            filtered_lines.append("")
+            continue
+        if any(pat.search(stripped) for pat in noise_patterns):
+            continue
+        filtered_lines.append(line)
+    cleaned = re.sub(r"\n{3,}", "\n\n", "\n".join(filtered_lines)).strip()
+    return cleaned
+
+def smart_truncate(text: str, max_chars: int = 1500) -> str:
+    """Intelligently truncate long output preserving both the header and findings/tail."""
+    if not text or len(text) <= max_chars:
+        return text
+    head_size = int(max_chars * 0.3)
+    tail_size = max_chars - head_size - 60
+    head = text[:head_size].rstrip()
+    tail = text[-tail_size:].lstrip()
+    return f"{head}\n\n... [output truncated for brevity — findings below] ...\n\n{tail}"
 
 def sanitize_target(raw_target: str) -> str:
     """Extract clean hostname/IP from a target that may be a full URL.
@@ -130,8 +241,12 @@ def ask(
     os_name = platform.system()
     console.print(f"[bold cyan]Detected OS:[/bold cyan] {os_name}")
 
+    ensure_python_in_path()
+    refresh_system_path()
+
     client = get_client(base_url=url, api_key=api_key)
     console.print(f"[dim]→ Using model: {model} | Endpoint: {client.chat.completions.base_url}[/dim]")
+    console.print(f"[dim]→ {get_tools_context().splitlines()[0]}[/dim]")
 
     if real:
         simulate = False
@@ -148,12 +263,22 @@ def ask(
     
     # Load session if it exists
     session_file = ".ares_session.json"
+    executed_commands: dict[str, int] = {}
     if os.path.exists(session_file) and Confirm.ask("Found a previous session. Resume?", default=True):
         with open(session_file, 'r', encoding='utf-8') as f:
             session = json.load(f)
             report = session.get("report", "")
             previous_output = session.get("previous_output", "")
             step_count = session.get("step_count", 0)
+            saved_cmds = session.get("executed_commands", [])
+            if saved_cmds:
+                executed_commands = {normalize_command(cmd): idx + 1 for idx, cmd in enumerate(saved_cmds)}
+            else:
+                for match in re.finditer(r"### Step (\d+): `(.*?)`", report):
+                    step_num = int(match.group(1))
+                    cmd_norm = normalize_command(match.group(2))
+                    if cmd_norm:
+                        executed_commands[cmd_norm] = step_num
     else:
         report = f"# Pentest Report\n**OS:** {os_name}\n**Started:** 2026-01-20\n\n## Findings & Steps\n"
         previous_output = ""
@@ -185,14 +310,16 @@ def ask(
                 context_prefix = f"Conversation History:\n{conv_text}\n\n" if conv_text else ""
                 
                 target_str = actual_target if actual_target != "None provided (Ask the user)" else "UNKNOWN"
+                tools_summary = get_tools_context()
                 
                 context = (
-                f"{context_prefix}Task: {question}\n"
-                f"Target: {target_str}\n"
-                f"OS: {os_name}\n"
-                f"CRITICAL: You are running on {os_name}. Use {os_name}-compatible commands (e.g. CMD or 'powershell -c' on Windows).\n"
-                f"Previous command output (truncated):\n{previous_output[:1400]}\n"
-                f"Current report tail:\n{report[-1000:]}\n"
+                    f"{context_prefix}Task: {question}\n"
+                    f"Target: {target_str}\n"
+                    f"OS: {os_name}\n"
+                    f"{tools_summary}\n"
+                    f"CRITICAL: You are running on {os_name}. Use {os_name}-compatible commands (e.g. CMD or 'powershell -c' on Windows).\n"
+                    f"Previous command output:\n{previous_output}\n\n"
+                    f"Current report tail (findings and previous steps):\n{report[-2500:]}\n"
                 )
 
                 if not initial_plan_done:
@@ -304,6 +431,27 @@ def ask(
                     break
                 continue
 
+            # --- Guardrail: Detect already executed commands (prevent duplicate loops) ---
+            norm_cmd = normalize_command(extracted_command)
+            if norm_cmd in executed_commands:
+                prev_step = executed_commands[norm_cmd]
+                console.print(f"[bold yellow]⚠ AI attempted to repeat command from Step {prev_step}: `{extracted_command}`[/bold yellow]")
+                previous_output = (
+                    f"SYSTEM ERROR: You already executed this exact command in Step {prev_step}: `{extracted_command}`. "
+                    f"Repeating previously executed commands (especially port scans) is strictly FORBIDDEN. "
+                    f"Review the findings from your previous steps in the report tail below, and proceed to the next phase: "
+                    f"- Enumerate or test the specific open ports and services already discovered. "
+                    f"- If web services (HTTP/HTTPS) were found, use curl or Python to inspect headers and paths. "
+                    f"- Do NOT run another port scan on this target."
+                )
+                consecutive_failures += 1
+                if consecutive_failures >= 3:
+                    console.print("[bold red]Too many consecutive failures — stopping to prevent infinite loop.[/bold red]")
+                    task_finished = True
+                    report += "\n\n## Final Summary\nStopped: model repeatedly generated duplicate commands."
+                    break
+                continue
+
             # --- Guardrail: Detect repeated failed commands ---
             if extracted_command == last_failed_command:
                 console.print(f"[bold yellow]⚠ Model repeated a previously failed command — requesting alternative[/bold yellow]")
@@ -320,6 +468,49 @@ def ask(
                     break
                 continue
 
+            # --- Proactive Tool Check & Missing Tool Guardrail ---
+            effective_tool = tool_required or infer_tool_from_command(extracted_command)
+            if effective_tool and effective_tool.lower() not in SHELL_BUILTINS:
+                if not shutil.which(effective_tool):
+                    if effective_tool not in attempted_installs:
+                        console.print(f"[yellow]Proactively detected missing tool: {effective_tool}[/yellow]")
+                        attempted_installs.add(effective_tool)
+                        install_cmd = None
+                        if os_name == "Windows":
+                            install_cmd = f"winget install {effective_tool} -e --accept-source-agreements --accept-package-agreements"
+                        elif os_name == "Linux":
+                            install_cmd = f"sudo apt update && sudo apt install -y {effective_tool}"
+                        elif os_name == "Darwin":
+                            install_cmd = f"brew install {effective_tool}"
+
+                        if install_cmd and (auto_confirm or Confirm.ask(f"Attempt to install {effective_tool} now?", default=False)):
+                            console.print(f"[green]Running install for {effective_tool}...[/green]")
+                            subprocess.run(install_cmd, shell=True)
+                            refresh_system_path()
+                            if shutil.which(effective_tool):
+                                console.print(f"[green]Successfully installed {effective_tool}![/green]")
+                            else:
+                                console.print(f"[bold red]Install attempt completed, but '{effective_tool}' is still not found on PATH.[/bold red]")
+
+                    # Verify if tool is actually present after install attempt
+                    if not shutil.which(effective_tool):
+                        console.print(f"[bold red]Tool '{effective_tool}' is not installed or available on this system. Skipping execution.[/bold red]")
+                        previous_output = (
+                            f"SYSTEM ERROR: The tool '{effective_tool}' is NOT installed or available on this {os_name} system. "
+                            f"Auto-install was unsuccessful or unavailable. Do NOT call '{effective_tool}' again. "
+                            f"Instead, use an available tool (e.g. Python scripts using urllib/requests, curl, PowerShell) "
+                            f"or choose an installed tool from the available tools list to perform this task."
+                        )
+                        last_failed_command = extracted_command
+                        consecutive_failures += 1
+                        report += f"\n### Step (Skipped): `{extracted_command}`\nTool '{effective_tool}' is not installed on system.\n"
+                        if consecutive_failures >= 3:
+                            console.print("[bold red]Too many consecutive failures — stopping to prevent infinite loop.[/bold red]")
+                            task_finished = True
+                            report += "\n\n## Final Summary\nStopped: required tools are not installed."
+                            break
+                        continue
+
             if step_count >= 20:
                 console.print("[yellow]Maximum steps (20) reached. Stopping to prevent infinite loop.[/yellow]")
                 task_finished = True
@@ -333,43 +524,10 @@ def ask(
                 console.print("[yellow]Simulation mode — no real execution[/yellow]")
                 previous_output = "SIMULATED SUCCESS (assume command worked and generated expected output. Output [TASK_COMPLETED] if finished)."
                 report += f"\n### Step {step_count}: `{extracted_command}`\n(simulated)\n"
+                executed_commands[norm_cmd] = step_count
                 consecutive_failures = 0
                 last_failed_command = None
                 continue
-
-            # --- Proactive Tool Check ---
-            effective_tool = tool_required or infer_tool_from_command(extracted_command)
-            if effective_tool and effective_tool.lower() not in ["cmd", "powershell", "echo", "cd", "dir", "type", "findstr", "where"]:
-                if not shutil.which(effective_tool) and effective_tool not in attempted_installs:
-                    console.print(f"[yellow]Proactively detected missing tool: {effective_tool}[/yellow]")
-                    attempted_installs.add(effective_tool)
-                    install_cmd = None
-                    if os_name == "Windows":
-                        install_cmd = f"winget install {effective_tool} -e --accept-source-agreements --accept-package-agreements"
-                    elif os_name == "Linux":
-                        install_cmd = f"sudo apt update && sudo apt install -y {effective_tool}"
-                    elif os_name == "Darwin":
-                        install_cmd = f"brew install {effective_tool}"
-
-                    if install_cmd and (auto_confirm or Confirm.ask(f"Attempt to install {effective_tool} now?", default=False)):
-                        console.print(f"[green]Running install for {effective_tool}...[/green]")
-                        subprocess.run(install_cmd, shell=True)
-                        console.print("[green]Install attempt completed.[/green]")
-                        
-                        # Refresh PATH on Windows
-                        if os_name == "Windows":
-                            try:
-                                import winreg
-                                with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, r"SYSTEM\CurrentControlSet\Control\Session Manager\Environment") as key:
-                                    sys_path = winreg.ExpandEnvironmentStrings(winreg.QueryValueEx(key, "Path")[0])
-                                try:
-                                    with winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"Environment") as key:
-                                        user_path = winreg.ExpandEnvironmentStrings(winreg.QueryValueEx(key, "Path")[0])
-                                except FileNotFoundError:
-                                    user_path = ""
-                                os.environ["PATH"] = sys_path + ";" + user_path
-                            except Exception:
-                                pass
 
             # Real execution decision
             should_execute = auto_confirm or Confirm.ask(f"Execute step {step_count} now?", default=False)
@@ -454,6 +612,9 @@ def ask(
 
             console.print(f"[dim]Exit code indication: {return_code}[/dim]")
 
+            # Clean output of transient progress/stats noise
+            cleaned_output = clean_command_output(output)
+
             # --- Track failures for repeat/consecutive detection ---
             if return_code != 0:
                 last_failed_command = extracted_command
@@ -467,16 +628,20 @@ def ask(
                 last_failed_command = None
                 consecutive_failures = 0
 
-            report += f"\n### Step {step_count}: `{extracted_command}`\nOutput (truncated):\n{output[:350]}...\n"
-            previous_output = f"Command: {extracted_command}\nOutput:\n{output}"
+            # Store smart-truncated findings into report and previous_output
+            report_snippet = smart_truncate(cleaned_output, max_chars=1200)
+            report += f"\n### Step {step_count}: `{extracted_command}`\nOutput:\n{report_snippet}\n"
+            previous_output = f"Command: {extracted_command}\nOutput:\n{smart_truncate(cleaned_output, max_chars=2500)}"
+            executed_commands[norm_cmd] = step_count
 
             # Save checkpoint
             with open(session_file, 'w', encoding='utf-8') as f:
                 json.dump({
                     "report": report,
                     "previous_output": previous_output,
-                    "step_count": step_count
-                }, f)
+                    "step_count": step_count,
+                    "executed_commands": list(executed_commands.keys()),
+                }, f, indent=2)
 
         # Show final report
         if task_finished:
