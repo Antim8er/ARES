@@ -134,6 +134,13 @@ def test_get_tools_context():
     assert "UNAVAILABLE tools" in ctx
 
 
+def test_bug_hunting_tools_included():
+    """Ensure key bug bounty tools from TomNomNom and ProjectDiscovery are tracked."""
+    from ares.cli import KNOWN_TOOLS
+    for tool in ["assetfinder", "httprobe", "waybackurls", "anew", "gf", "qsreplace", "subfinder", "httpx", "nuclei", "katana", "arjun"]:
+        assert tool in KNOWN_TOOLS
+
+
 def test_has_placeholders():
     """Verify placeholder tokens are correctly detected."""
     from ares.cli import has_placeholders
@@ -142,6 +149,9 @@ def test_has_placeholders():
     assert has_placeholders("nikto -h {ip}") == "{ip}"
     assert has_placeholders("ping TARGET_IP") == "TARGET_IP"
     assert has_placeholders("nmap -sV example.com") is None
+    # Verify standard HTML tags are not falsely treated as placeholders
+    assert has_placeholders("python -c \"re.findall(r'<title>(.*?)</title>', html)\"") is None
+    assert has_placeholders("curl https://example.com/ -d '<form>'") is None
 
 
 def test_session_command_regex_extraction():

@@ -71,7 +71,44 @@ def strip_ansi(text):
 # Guardrail & Tool helpers
 # ---------------------------------------------------------------------------
 
-KNOWN_TOOLS = ["nmap", "curl", "python", "git", "powershell", "sqlmap", "nikto", "gobuster", "ffuf", "hydra", "wpscan"]
+KNOWN_TOOLS = [
+    # Core Network & Pentest
+    "nmap", "curl", "python", "git", "powershell", "go", "sqlmap", "nikto", "hydra",
+    # Fuzzing & Content Discovery
+    "ffuf", "gobuster", "dirsearch", "wfuzz",
+    # TomNomNom Tools
+    "assetfinder", "httprobe", "waybackurls", "anew", "gf", "qsreplace", "meg",
+    # ProjectDiscovery & Modern Bug Bounty Tools
+    "subfinder", "httpx", "nuclei", "katana", "naabu", "dnsx",
+    # Community Recon & Parameter Discovery
+    "gau", "amass", "arjun", "wpscan", "whatweb", "whois", "dig"
+]
+
+# Package mappings for Go-based bug hunting tools
+GO_TOOL_PACKAGES = {
+    "assetfinder": "github.com/tomnomnom/assetfinder@latest",
+    "httprobe": "github.com/tomnomnom/httprobe@latest",
+    "waybackurls": "github.com/tomnomnom/waybackurls@latest",
+    "anew": "github.com/tomnomnom/anew@latest",
+    "gf": "github.com/tomnomnom/gf@latest",
+    "qsreplace": "github.com/tomnomnom/qsreplace@latest",
+    "meg": "github.com/tomnomnom/meg@latest",
+    "subfinder": "github.com/projectdiscovery/subfinder/v2/cmd/subfinder@latest",
+    "httpx": "github.com/projectdiscovery/httpx/cmd/httpx@latest",
+    "nuclei": "github.com/projectdiscovery/nuclei/v3/cmd/nuclei@latest",
+    "katana": "github.com/projectdiscovery/katana/cmd/katana@latest",
+    "naabu": "github.com/projectdiscovery/naabu/v2/cmd/naabu@latest",
+    "dnsx": "github.com/projectdiscovery/dnsx/cmd/dnsx@latest",
+    "gau": "github.com/lc/gau/v2/cmd/gau@latest",
+    "ffuf": "github.com/ffuf/ffuf/v2@latest",
+}
+
+# Package mappings for Python-based bug hunting tools
+PIP_TOOL_PACKAGES = {
+    "arjun": "arjun",
+    "dirsearch": "dirsearch",
+    "wfuzz": "wfuzz",
+}
 
 SHELL_BUILTINS = {
     "cmd", "powershell", "pwsh", "bash", "sh", "zsh",
@@ -81,15 +118,15 @@ SHELL_BUILTINS = {
 }
 
 def ensure_python_in_path():
-    """Ensure running Python directory and scripts are in PATH so CLI/inline scripts work reliably."""
+    """Ensure running Python directory, scripts, and Go bin are in PATH so CLI tools work reliably."""
     py_dir = os.path.dirname(sys.executable)
     scripts_dir = os.path.join(py_dir, "Scripts")
+    go_bin = os.path.expanduser(os.path.join("~", "go", "bin"))
     path_entries = [p for p in os.environ.get("PATH", "").split(os.pathsep) if p]
     new_entries = []
-    if py_dir not in path_entries:
-        new_entries.append(py_dir)
-    if scripts_dir not in path_entries:
-        new_entries.append(scripts_dir)
+    for d in [py_dir, scripts_dir, go_bin]:
+        if os.path.exists(d) and d not in path_entries and d not in new_entries:
+            new_entries.append(d)
     if new_entries:
         os.environ["PATH"] = os.pathsep.join(new_entries + path_entries)
 
@@ -201,6 +238,14 @@ def sanitize_target(raw_target: str) -> str:
     return raw_target.rstrip("/")
 
 
+# Common HTML/XML tags and attributes to ignore in placeholder detection
+_HTML_XML_TAGS = {
+    "title", "html", "head", "body", "div", "span", "p", "a", "h1", "h2", "h3", "h4", "h5", "h6",
+    "table", "tr", "td", "th", "thead", "tbody", "ul", "ol", "li", "form", "input", "button",
+    "select", "option", "textarea", "img", "script", "style", "meta", "link", "header", "footer",
+    "nav", "section", "article", "aside", "main", "iframe", "code", "pre", "b", "i", "u", "strong", "em"
+}
+
 # Regex to detect unreplaced placeholder tokens like <target-ip>, [target], {ip}, TARGET_IP
 _PLACEHOLDER_RE = re.compile(
     r'<[a-zA-Z][a-zA-Z0-9_\-]*>'        # <target-ip>, <url>, <domain>
@@ -211,9 +256,18 @@ _PLACEHOLDER_RE = re.compile(
 
 
 def has_placeholders(command: str) -> str | None:
-    """Return the first placeholder token found in a command, or None if clean."""
-    match = _PLACEHOLDER_RE.search(command)
-    return match.group(0) if match else None
+    """Return the first placeholder token found in a command, or None if clean.
+
+    Ignores common HTML/XML elements so web-scraping regexes like `<title>` are not blocked.
+    """
+    for match in _PLACEHOLDER_RE.finditer(command):
+        token = match.group(0)
+        if token.startswith("<") and token.endswith(">"):
+            tag_name = token[1:-1].lower()
+            if tag_name in _HTML_XML_TAGS:
+                continue
+        return token
+    return None
 
 
 def infer_tool_from_command(command: str) -> str:
@@ -460,29 +514,6 @@ def ask(
                     break
                 continue
 
-            # --- Guardrail: Detect already executed commands (prevent duplicate loops) ---
-            norm_cmd = normalize_command(extracted_command)
-            if norm_cmd in executed_commands:
-                prev_step = executed_commands[norm_cmd]
-                console.print(f"[bold yellow]⚠ AI attempted to repeat command from Step {prev_step}: `{extracted_command}`[/bold yellow]")
-                previous_output = (
-                    f"SYSTEM ERROR: You already executed this exact command in Step {prev_step}: `{extracted_command}`. "
-                    f"Repeating previously executed commands is strictly FORBIDDEN. "
-                    f"You must provide a NEW, DIFFERENT command. For web targets on ports 80/443, pick one of:\n"
-                    f"  - Check robots.txt: curl -sL https://{actual_target}/robots.txt\n"
-                    f"  - Check sensitive paths: python -c \"import urllib.request; [print(p, urllib.request.urlopen('https://{actual_target}' + p).getcode()) for p in ['/robots.txt', '/.env', '/admin', '/login', '/sitemap.xml'] if True]\"\n"
-                    f"  - Test Nmap web vulnerability scripts: nmap -sV --script http-enum,http-headers -p 80,443 {actual_target}\n"
-                    f"  - Extract page title and forms: python -c \"import urllib.request, re; html = urllib.request.urlopen('https://{actual_target}').read().decode('utf-8', 'ignore'); print('Title:', re.findall(r'<title>(.*?)</title>', html, re.I))\"\n"
-                    f"Generate your next new command now."
-                )
-                consecutive_failures += 1
-                if consecutive_failures >= 3:
-                    console.print("[bold red]Too many consecutive failures — stopping to prevent infinite loop.[/bold red]")
-                    task_finished = True
-                    report += "\n\n## Final Summary\nStopped: model repeatedly generated duplicate commands."
-                    break
-                continue
-
             # --- Guardrail: Detect repeated failed commands ---
             if extracted_command == last_failed_command:
                 console.print(f"[bold yellow]⚠ Model repeated a previously failed command — requesting alternative[/bold yellow]")
@@ -499,6 +530,29 @@ def ask(
                     break
                 continue
 
+            # --- Guardrail: Detect already executed commands (prevent duplicate loops) ---
+            norm_cmd = normalize_command(extracted_command)
+            if norm_cmd in executed_commands:
+                prev_step = executed_commands[norm_cmd]
+                console.print(f"[bold yellow]⚠ AI attempted to repeat command from Step {prev_step}: `{extracted_command}`[/bold yellow]")
+                previous_output = (
+                    f"SYSTEM ERROR: You already executed this exact command in Step {prev_step}: `{extracted_command}`. "
+                    f"Repeating previously executed commands is strictly FORBIDDEN. "
+                    f"You must provide a NEW, DIFFERENT command. For web targets on ports 80/443, pick one of:\n"
+                    f"  - Check robots.txt: curl -sI https://{actual_target}/robots.txt\n"
+                    f"  - Check sensitive paths: curl -sI https://{actual_target}/.env\n"
+                    f"  - Check sitemap: curl -sL https://{actual_target}/sitemap.xml\n"
+                    f"  - Test Nmap web vulnerability scripts: nmap -sV --script http-enum,http-headers -p 80,443 {actual_target}\n"
+                    f"Generate your next new command now."
+                )
+                consecutive_failures += 1
+                if consecutive_failures >= 3:
+                    console.print("[bold red]Too many consecutive failures — stopping to prevent infinite loop.[/bold red]")
+                    task_finished = True
+                    report += "\n\n## Final Summary\nStopped: model repeatedly generated duplicate commands."
+                    break
+                continue
+
             # --- Proactive Tool Check & Missing Tool Guardrail ---
             effective_tool = tool_required or infer_tool_from_command(extracted_command)
             if effective_tool and effective_tool.lower() not in SHELL_BUILTINS:
@@ -507,7 +561,11 @@ def ask(
                         console.print(f"[yellow]Proactively detected missing tool: {effective_tool}[/yellow]")
                         attempted_installs.add(effective_tool)
                         install_cmd = None
-                        if os_name == "Windows":
+                        if effective_tool in GO_TOOL_PACKAGES and shutil.which("go"):
+                            install_cmd = f"go install {GO_TOOL_PACKAGES[effective_tool]}"
+                        elif effective_tool in PIP_TOOL_PACKAGES and shutil.which("python"):
+                            install_cmd = f"{sys.executable} -m pip install {PIP_TOOL_PACKAGES[effective_tool]}"
+                        elif os_name == "Windows":
                             install_cmd = f"winget install {effective_tool} -e --accept-source-agreements --accept-package-agreements"
                         elif os_name == "Linux":
                             install_cmd = f"sudo apt update && sudo apt install -y {effective_tool}"
